@@ -1,0 +1,161 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.1.1/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.2.0/plugin.yaml
+  - http://www.getcloudify.org/spec/docker-plugin/1.3.2/plugin.yaml
+  - https://raw.githubusercontent.com/cloudify-incubator/cloudify-utilities-plugin/1.2.5/plugin.yaml
+
+inputs:
+
+  image:
+    default: { get_secret: ubuntu_trusty_image }
+  flavor:
+    default: { get_secret: small_image_flavor }
+  agent_user:
+    default: ubuntu
+  agent_key_private:
+    default: { get_secret: agent_key_private } 
+  wizard_docker_image:
+    default:  'https://s3-eu-west-1.amazonaws.com/gigaspaces-delivery/vnf-wizard/mwc-latest.tar'
+  public_network_name:
+    default: { get_secret: public_network_name }
+  external_network_name:
+    default: { get_secret: external_network_name }
+
+  keystone_username:
+    default: { get_secret: keystone_username }
+  keystone_password:
+    default: { get_secret: keystone_password }
+  keystone_tenant_name:
+    default: { get_secret: keystone_tenant_name }
+  keystone_url:
+    default: { get_secret: keystone_url }
+  region:
+    default: { get_secret: region }
+
+dsl_definitions:
+
+  openstack_config: &openstack_config
+    username: { get_input: keystone_username }
+    password: { get_input: keystone_password }
+    tenant_name: { get_input: keystone_tenant_name }
+    auth_url: { get_input: keystone_url }
+    region: { get_input: region }
+
+node_types:
+
+
+  instance:
+    derived_from: cloudify.openstack.nodes.Server
+    properties:
+      agent_config:
+        default:
+          user: { get_input: agent_user }
+          install_method: remote
+          port: 22
+          key: { get_input: agent_key_private }
+      cloudify_agent:
+        default:
+          agent_key_path: { get_input: agent_key_private }
+          user: { get_input: agent_user }
+      management_network_name:
+        default: { get_input: public_network_name }
+      server:
+        default:
+          image: { get_input: image }
+          flavor: { get_input: flavor }
+          userdata: { get_attribute: [cloudify_host_cloud_config, cloud_config] }
+
+node_templates:
+
+
+  cloudify_host_cloud_config:
+    type: cloudify.nodes.CloudInit.CloudConfig
+    properties:
+      resource_config:
+        groups:
+          - wheel
+        users:
+          - name: { get_input: agent_user }
+            primary-group: wheel
+            shell: /bin/bash
+            sudo: ['ALL=(ALL) NOPASSWD:ALL']
+            ssh-authorized-keys:
+              - { get_secret: agent_key_public }
+        runcmd:
+          - sudo service ssh stop
+          - curl -o install.sh -sSL 'https://get.docker.com/'
+          - sudo sh install.sh
+          - sudo groupadd docker
+          - sudo gpasswd -a ubuntu docker
+          - sudo service docker restart
+          - sudo service ssh start
+
+  wizard_floatingip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      openstack_config: *openstack_config
+      floatingip:
+        floating_network_name: { get_input: external_network_name }
+
+  wizard_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      security_group:
+        name: VNFWizardSG
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          port: 80
+        - remote_ip_prefix: 0.0.0.0/0
+          port: 5000
+        - remote_ip_prefix: 0.0.0.0/0
+          port: 22
+      openstack_config: *openstack_config
+
+
+  wizard_vm:
+    type: instance
+    properties:
+      resource_id: 'vnf-wizard'
+      openstack_config: *openstack_config
+    relationships:
+      - type: cloudify.openstack.server_connected_to_floating_ip
+        target: wizard_floatingip
+      - type: cloudify.openstack.server_connected_to_security_group
+        target: wizard_security_group
+      - type: cloudify.relationships.depends_on
+        target: cloudify_host_cloud_config
+
+  wizard:
+    type: cloudify.docker.Container
+    properties:
+      name: 'vnf-wizard'
+      image:
+        src: { get_input: wizard_docker_image }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: docker.docker_plugin.tasks.create_container
+          inputs:
+            params:
+              command: '/bin/bash run_wizard.sh'
+              ports:
+                - 3000
+                - 5000
+            cloudify.interfaces.lifecycle:
+        start:
+          implementation: docker.docker_plugin.tasks.start
+          inputs:
+            params:
+              port_bindings:
+                3000: 80
+                5000: 5000
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: wizard_vm
+
+
+outputs:
+  wizard_ip:
+    value: { get_attribute: [wizard_floatingip, floating_ip_address] }
